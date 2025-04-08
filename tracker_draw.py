@@ -65,7 +65,9 @@ class DrawTracker:
         
         # Store features of tracked object
         self.tracked_features = None
-        self.reid_threshold = 0.85  # Increased from 0.7 to 0.85 for stricter matching
+        self.reid_threshold = 0.90  # Increased threshold for high confidence matches
+        self.recovery_threshold = 0.85  # Increased recovery threshold
+        self.show_threshold = 0.70  # Threshold for showing matches at all
         
         # Add debug mode
         self.debug_mode = True
@@ -105,9 +107,25 @@ class DrawTracker:
         
         # Add tracking state variables
         self.lost_track_frames = 0
-        self.max_lost_frames = 10  # Number of frames to wait before considering track lost
+        self.max_lost_frames = 30  # Increased from 10 to 30 frames
         self.last_valid_bbox = None  # Store last valid bounding box
         self.track_lost = False  # Flag to indicate if track is lost
+        
+        # Add confidence tracking
+        self.consecutive_matches = 0
+        self.min_consecutive_matches = 3  # Require multiple consecutive matches before switching
+        self.last_match_camera = None
+        self.last_match_box = None
+        
+        # Add tracking recovery parameters
+        self.recovery_roi_scale = 1.5  # Scale factor for search region when track is lost
+        self.last_known_size = None  # Store last known object size for recovery
+        self.last_known_position = None  # Store last known position for recovery
+        
+        # Track highest confidence seen
+        self.highest_confidence_seen = 0.0
+        self.highest_confidence_camera = None
+        self.highest_confidence_box = None
     
     def extract_reid_features(self, frame, bbox):
         """Extract ReID features from a person bounding box"""
@@ -174,6 +192,65 @@ class DrawTracker:
             logger.error(f"Error detecting persons: {str(e)}")
             return []
     
+    def update_tracking_state(self, frame, bbox):
+        """Update tracking state with new detection"""
+        x, y, w, h = [int(v) for v in bbox]
+        self.last_known_position = (x + w//2, y + h//2)  # Center point
+        self.last_known_size = (w, h)
+        self.last_valid_bbox = bbox
+        
+        # Extract new ReID features
+        new_features = self.extract_reid_features(frame, bbox)
+        if new_features is not None:
+            # Update features with moving average
+            if self.tracked_features is None:
+                self.tracked_features = new_features
+            else:
+                alpha = 0.7  # Weight for current features
+                self.tracked_features = alpha * self.tracked_features + (1 - alpha) * new_features
+
+    def recover_lost_track(self, frame, camera_idx):
+        """Attempt to recover lost track using last known position and size"""
+        if self.last_known_position is None or self.last_known_size is None:
+            return None, 0.0
+
+        # Get frame dimensions
+        frame_height, frame_width = frame.shape[:2]
+        center_x, center_y = self.last_known_position
+        w, h = self.last_known_size
+
+        # Calculate search region (expanded)
+        search_w = int(w * self.recovery_roi_scale)
+        search_h = int(h * self.recovery_roi_scale)
+        search_x = max(0, center_x - search_w//2)
+        search_y = max(0, center_y - search_h//2)
+        search_w = min(search_w, frame_width - search_x)
+        search_h = min(search_h, frame_height - search_y)
+
+        # Detect persons in frame
+        detected_boxes = self.detect_person_in_frame(frame)
+        best_match = None
+        best_similarity = 0
+
+        for box in detected_boxes:
+            # Check if detection is in search region
+            x, y, w, h = box
+            box_center_x = x + w//2
+            box_center_y = y + h//2
+            
+            if (abs(box_center_x - center_x) < search_w//2 and 
+                abs(box_center_y - center_y) < search_h//2):
+                
+                features = self.extract_reid_features(frame, box)
+                if features is not None:
+                    similarity = self.compute_similarity(self.tracked_features, features)
+                    
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_match = box
+
+        return best_match, best_similarity
+
     def run(self):
         """Run the tracker on multiple video streams."""
         self.running = True
@@ -182,9 +259,13 @@ class DrawTracker:
         print("\n=== Multi-Camera Person Tracking System ===")
         print("Controls:")
         print("  'p' - Pause/Resume video playback")
-        print("  's' - Start drawing tracking box on any camera")
+        print("  Click - Select object to track (video must be paused)")
         print("  'q' - Quit the application")
-        print("\nVideos are playing. Press 's' to start drawing a tracking box on any camera.")
+        print("\nTo select an object to track:")
+        print("1. Press 'p' to pause the video")
+        print("2. Click near the object you want to track")
+        print("3. Press 'p' again to resume tracking")
+        print("\nVideos are playing. Press 'p' to pause and select an object.")
         print("=====================================\n")
         
         # Create windows for each camera
@@ -223,52 +304,57 @@ class DrawTracker:
                 if self.tracking_enabled:
                     if i == self.tracking_camera:
                         if self.track_lost:
-                            # If track was lost, try to find match in this camera
-                            detected_boxes = self.detect_person_in_frame(frame)
-                            best_match = None
-                            best_similarity = 0
+                            # Try to recover track
+                            recovered_box, similarity = self.recover_lost_track(frame, i)
                             
-                            for box in detected_boxes:
-                                features = self.extract_reid_features(frame, box)
-                                if features is not None:
-                                    similarity = self.compute_similarity(self.tracked_features, features)
-                                    if similarity > best_similarity:
-                                        best_similarity = similarity
-                                        best_match = box
-                            
-                            if best_match is not None and best_similarity > self.reid_threshold:
-                                # Found match in original camera, resume tracking
+                            if recovered_box is not None and similarity > self.recovery_threshold:
+                                # Reinitialize tracker with recovered box
                                 self.tracker = cv2.legacy.TrackerCSRT_create()
-                                success = self.tracker.init(frame, best_match)
+                                success = self.tracker.init(frame, recovered_box)
+                                
                                 if success:
                                     self.track_lost = False
                                     self.lost_track_frames = 0
-                                    logger.info(f"Resumed tracking in camera {i+1}")
+                                    self.update_tracking_state(frame, recovered_box)
                                     
-                                    x, y, w, h = best_match
+                                    x, y, w, h = recovered_box
                                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                                    cv2.putText(frame, "Tracking Resumed", (x, y - 10),
-                                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                    cv2.putText(frame, f"Track Recovered ({similarity*100:.1f}%)", 
+                                              (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                         else:
                             # Normal tracking update
                             success, bbox = self.tracker.update(frame)
                             
                             if success:
-                                # Reset lost track counter on successful tracking
+                                # Update tracking state
+                                self.update_tracking_state(frame, bbox)
                                 self.lost_track_frames = 0
-                                self.last_valid_bbox = bbox
                                 
                                 # Draw tracking box
                                 (x, y, w, h) = [int(v) for v in bbox]
                                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                                 cv2.putText(frame, "Tracking", (x, y - 10),
                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                                
-                                # Update ReID features periodically
-                                self.tracked_features = self.extract_reid_features(frame, bbox)
                             else:
-                                # Increment lost track counter
-                                self.lost_track_frames += 1
+                                # Try immediate recovery before counting as lost frame
+                                recovered_box, similarity = self.recover_lost_track(frame, i)
+                                
+                                if recovered_box is not None and similarity > self.recovery_threshold:
+                                    # Reinitialize tracker with recovered box
+                                    self.tracker = cv2.legacy.TrackerCSRT_create()
+                                    success = self.tracker.init(frame, recovered_box)
+                                    
+                                    if success:
+                                        self.update_tracking_state(frame, recovered_box)
+                                        x, y, w, h = recovered_box
+                                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                                        cv2.putText(frame, f"Track Stabilized ({similarity*100:.1f}%)", 
+                                                  (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                    else:
+                                        self.lost_track_frames += 1
+                                else:
+                                    self.lost_track_frames += 1
+                                
                                 if self.lost_track_frames >= self.max_lost_frames:
                                     self.track_lost = True
                                     logger.info(f"Lost track in camera {i+1}, switching to search mode")
@@ -280,46 +366,117 @@ class DrawTracker:
                         best_match = None
                         best_similarity = 0
                         
+                        # Store all matches for display
+                        all_matches = []
+                        
                         for box in detected_boxes:
                             features = self.extract_reid_features(frame, box)
                             if features is not None:
                                 similarity = self.compute_similarity(self.tracked_features, features)
+                                all_matches.append((box, similarity))
                                 
                                 if similarity > best_similarity:
                                     best_similarity = similarity
                                     best_match = (box, similarity)
+                                    
+                                    # Update highest confidence seen
+                                    if similarity > self.highest_confidence_seen:
+                                        self.highest_confidence_seen = similarity
+                                        self.highest_confidence_camera = i
+                                        self.highest_confidence_box = box
                                 
                                 # Draw all detection boxes with scores in debug mode
-                                if self.debug_mode:
+                                if self.debug_mode and similarity > self.show_threshold:
                                     x, y, w, h = box
-                                    color = (0, 165, 255)  # Orange for non-matches
-                                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
-                                    cv2.putText(frame, f"{similarity:.2f}", (x, y - 5),
-                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                                    # Color based on similarity threshold
+                                    if similarity > self.reid_threshold:
+                                        color = (0, 255, 0)  # Green for high confidence
+                                        thickness = 3  # Thicker box for high confidence
+                                    elif similarity > 0.8:
+                                        color = (0, 165, 255)  # Orange for medium confidence
+                                        thickness = 2
+                                    else:
+                                        color = (0, 0, 255)  # Red for low confidence
+                                        thickness = 1
+                                        
+                                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
+                                    
+                                    # Add percentage text with background for better visibility
+                                    text = f"{similarity*100:.1f}%"
+                                    font = cv2.FONT_HERSHEY_SIMPLEX
+                                    font_scale = 0.6
+                                    font_thickness = 2
+                                    
+                                    # Get text size
+                                    (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, font_thickness)
+                                    
+                                    # Draw background rectangle
+                                    cv2.rectangle(frame, (x, y - text_height - 5), (x + text_width, y), color, -1)
+                                    
+                                    # Draw text
+                                    cv2.putText(frame, text, (x, y - 5),
+                                              font, font_scale, (255, 255, 255), font_thickness)
+                        
+                        # Display match statistics on frame
+                        if self.debug_mode and all_matches:
+                            # Sort matches by similarity
+                            all_matches.sort(key=lambda x: x[1], reverse=True)
+                            
+                            # Display top matches and highest seen
+                            y_pos = 30
+                            cv2.putText(frame, "Match Percentages:", (10, y_pos),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            
+                            # Show current top 3 matches
+                            for idx, (box, similarity) in enumerate(all_matches[:3], 1):
+                                if similarity > self.show_threshold:
+                                    y_pos += 25
+                                    color = (0, 255, 0) if similarity > self.reid_threshold else \
+                                           (0, 165, 255) if similarity > 0.8 else (0, 0, 255)
+                                    cv2.putText(frame, f"Match {idx}: {similarity*100:.1f}%", (10, y_pos),
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                            
+                            # Show highest confidence seen
+                            y_pos += 35
+                            cv2.putText(frame, f"Highest Match: {self.highest_confidence_seen*100:.1f}% (Cam {self.highest_confidence_camera+1})",
+                                      (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                            
+                            # Print to console
+                            if best_match is not None and best_similarity > self.show_threshold:
+                                print(f"\rCamera {i+1} - Best Match: {best_similarity*100:.1f}% | " + 
+                                      f"Highest Ever: {self.highest_confidence_seen*100:.1f}% (Cam {self.highest_confidence_camera+1})", end="")
                         
                         # If track is lost in primary camera and we find a good match here, switch cameras
                         if self.track_lost and best_match is not None:
                             box, similarity = best_match
+                            
+                            # Only consider very high confidence matches
                             if similarity > self.reid_threshold:
-                                # Switch tracking to this camera
-                                self.tracking_camera = i
-                                self.tracker = cv2.legacy.TrackerCSRT_create()
-                                success = self.tracker.init(frame, box)
-                                if success:
-                                    self.track_lost = False
-                                    self.lost_track_frames = 0
-                                    logger.info(f"Switched tracking to camera {i+1}")
-                                    
-                                    x, y, w, h = box
-                                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                                    cv2.putText(frame, "Tracking Switched", (x, y - 10),
-                                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                            elif best_similarity > 0:
-                                # Draw best match even if below threshold
-                                x, y, w, h = box
-                                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
-                                cv2.putText(frame, f"Potential Match: {similarity:.2f}", (x, y - 10),
-                                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                                # Check if this is a consistent match in the same camera
+                                if i == self.last_match_camera and self.similar_boxes(box, self.last_match_box):
+                                    self.consecutive_matches += 1
+                                    print(f"\nHigh confidence match in camera {i+1}: {similarity*100:.1f}% - Match {self.consecutive_matches}/{self.min_consecutive_matches}")
+                                else:
+                                    self.consecutive_matches = 1
+                                
+                                self.last_match_camera = i
+                                self.last_match_box = box
+                                
+                                # Only switch if we have consistent high confidence matches
+                                if self.consecutive_matches >= self.min_consecutive_matches:
+                                    print(f"\nSwitching to camera {i+1} - High confidence match: {similarity*100:.1f}%")
+                                    # Switch tracking to this camera
+                                    self.tracking_camera = i
+                                    self.tracker = cv2.legacy.TrackerCSRT_create()
+                                    success = self.tracker.init(frame, box)
+                                    if success:
+                                        self.track_lost = False
+                                        self.lost_track_frames = 0
+                                        
+                                        x, y, w, h = box
+                                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                                        cv2.putText(frame, f"Tracking Started ({similarity*100:.1f}%)", (x, y - 10),
+                                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
                 # Display the frame
                 cv2.imshow(f"Camera {i+1} - {os.path.basename(self.video_sources[i])}", frame)
@@ -336,120 +493,6 @@ class DrawTracker:
                 status = "Paused" if self.paused else "Resumed"
                 logger.info(f"Playback {status}")
                 print(f"\nPlayback {status}")
-            elif key == ord('s'):
-                # Pause all videos first
-                was_paused = self.paused
-                self.paused = True
-                
-                print("\n=== Draw Tracking Box ===")
-                print("Click and drag on any camera window to draw a box around the person/object you want to track.")
-                print("Press ENTER or SPACE to confirm your selection.")
-                print("Press ESC to cancel.")
-                
-                # Wait for the user to draw a box
-                while True:
-                    # Show the current frames with the box being drawn
-                    for i, frame in enumerate(frames):
-                        if frame is not None:
-                            frame_with_box = frame.copy()
-                            
-                            # Draw the box if we have start and end points and it's for this camera
-                            if self.current_camera == i and self.start_point is not None and self.end_point is not None:
-                                cv2.rectangle(frame_with_box, self.start_point, self.end_point, (0, 255, 0), 2)
-                            
-                            cv2.imshow(f"Camera {i+1} - {os.path.basename(self.video_sources[i])}", frame_with_box)
-                    
-                    # Wait for key press
-                    key = cv2.waitKey(100) & 0xFF
-                    if key == 27:  # ESC
-                        print("Selection cancelled")
-                        self.start_point = None
-                        self.end_point = None
-                        self.current_camera = None
-                        break
-                    elif key in [13, 32]:  # ENTER or SPACE
-                        if self.start_point is not None and self.end_point is not None and self.current_camera is not None:
-                            print("Box selected")
-                            break
-                        else:
-                            print("No box drawn. Click and drag on any camera to draw a box.")
-                
-                # If we have a valid box, initialize the tracker
-                if self.start_point is not None and self.end_point is not None and self.current_camera is not None:
-                    # Convert points to bbox format (x, y, width, height)
-                    x1, y1 = self.start_point
-                    x2, y2 = self.end_point
-                    x = min(x1, x2)
-                    y = min(y1, y2)
-                    w = abs(x2 - x1)
-                    h = abs(y2 - y1)
-                    
-                    # Validate bounding box coordinates
-                    frame_height, frame_width = frames[self.current_camera].shape[:2]
-                    
-                    # Ensure coordinates are within frame boundaries
-                    x = max(0, min(x, frame_width - 1))
-                    y = max(0, min(y, frame_height - 1))
-                    w = max(1, min(w, frame_width - x))
-                    h = max(1, min(h, frame_height - y))
-                    
-                    # Debug information
-                    logger.info(f"Frame dimensions: {frame_width}x{frame_height}")
-                    logger.info(f"Bounding box: x={x}, y={y}, w={w}, h={h}")
-                    
-                    # Initialize tracker only for the selected camera
-                    try:
-                        # Create tracker using legacy API which is more widely supported
-                        tracker_types = [
-                            ('CSRT', 'csrt'),
-                            ('KCF', 'kcf'),
-                            ('MIL', 'mil'),
-                            ('Boosting', 'boosting')
-                        ]
-                        
-                        for tracker_name, tracker_type in tracker_types:
-                            try:
-                                logger.info(f"Trying {tracker_name} tracker...")
-                                self.tracker = cv2.legacy.TrackerCSRT_create() if tracker_type == 'csrt' else \
-                                             cv2.legacy.TrackerKCF_create() if tracker_type == 'kcf' else \
-                                             cv2.legacy.TrackerMIL_create() if tracker_type == 'mil' else \
-                                             cv2.legacy.TrackerBoosting_create()
-                                
-                                frame_copy = frames[self.current_camera].copy()
-                                success = self.tracker.init(frame_copy, (x, y, w, h))
-                                
-                                if success:
-                                    self.tracking_enabled = True
-                                    self.tracking_camera = self.current_camera
-                                    logger.info(f"Successfully initialized {tracker_name} tracker for camera {self.current_camera+1}")
-                                    print(f"Tracking started with {tracker_name} tracker for camera {self.current_camera+1}")
-                                    break
-                                else:
-                                    logger.warning(f"{tracker_name} tracker initialization failed")
-                            except Exception as e:
-                                logger.warning(f"Error with {tracker_name} tracker: {str(e)}")
-                                continue
-                        
-                        if not self.tracking_enabled:
-                            logger.error("All tracker types failed to initialize")
-                            print("Failed to initialize any tracker. Please try drawing a larger box or selecting a different region.")
-                            self.tracker = None
-                            
-                    except Exception as e:
-                        logger.error(f"Error during tracker initialization: {str(e)}")
-                        print("Error initializing tracker. Please try again with a different region.")
-                        self.tracker = None
-                
-                # Reset drawing state
-                self.drawing = False
-                self.start_point = None
-                self.end_point = None
-                self.current_camera = None
-                
-                # Restore previous pause state
-                self.paused = was_paused
-                
-                print("\nPress 'p' to pause/resume, 's' to draw a new tracking box, or 'q' to quit")
         
         # Clean up
         for cap in self.caps:
@@ -458,21 +501,103 @@ class DrawTracker:
         logger.info("All tracking completed")
     
     def mouse_callback(self, event, x, y, flags, param):
-        """Handle mouse events for drawing bounding boxes."""
+        """Handle mouse events for object selection"""
         camera_idx = param
         
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.drawing = True
-            self.start_point = (x, y)
-            self.end_point = (x, y)
-            self.current_camera = camera_idx
-        elif event == cv2.EVENT_MOUSEMOVE:
-            if self.drawing and self.current_camera == camera_idx:
-                self.end_point = (x, y)
-        elif event == cv2.EVENT_LBUTTONUP:
-            if self.drawing and self.current_camera == camera_idx:
-                self.drawing = False
-                self.end_point = (x, y)
+            if not self.paused:
+                logger.info("Please pause the video ('p' key) before selecting an object")
+                return
+                
+            frame = None
+            if self.caps[camera_idx].isOpened():
+                ret, frame = self.caps[camera_idx].read()
+                if not ret:
+                    logger.error("Failed to read frame for object selection")
+                    return
+                    
+            # Get YOLO detections
+            detected_boxes = self.detect_person_in_frame(frame)
+            if not detected_boxes:
+                logger.info("No objects detected in frame")
+                return
+                
+            # Find the closest detection to the clicked point
+            closest_box = None
+            min_distance = float('inf')
+            max_distance = 100  # Maximum pixel distance to consider
+            
+            for box in detected_boxes:
+                box_x, box_y, box_w, box_h = box
+                # Calculate center of the box
+                box_center_x = box_x + box_w // 2
+                box_center_y = box_y + box_h // 2
+                
+                # Calculate distance to clicked point
+                distance = ((box_center_x - x) ** 2 + (box_center_y - y) ** 2) ** 0.5
+                
+                if distance < min_distance and distance < max_distance:
+                    min_distance = distance
+                    closest_box = box
+            
+            if closest_box is not None:
+                # Initialize tracker with the closest detection
+                try:
+                    self.tracker = cv2.legacy.TrackerCSRT_create()
+                    success = self.tracker.init(frame, closest_box)
+                    
+                    if success:
+                        self.tracking_enabled = True
+                        self.tracking_camera = camera_idx
+                        self.track_lost = False
+                        self.lost_track_frames = 0
+                        
+                        # Extract initial ReID features
+                        self.tracked_features = self.extract_reid_features(frame, closest_box)
+                        
+                        logger.info(f"Started tracking object in camera {camera_idx + 1}")
+                        print(f"\nTracking started in camera {camera_idx + 1}")
+                        
+                        # Draw the selected box
+                        x, y, w, h = closest_box
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        cv2.putText(frame, "Selected for Tracking", (x, y - 10),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        cv2.imshow(f"Camera {camera_idx+1} - {os.path.basename(self.video_sources[camera_idx])}", frame)
+                    else:
+                        logger.error("Failed to initialize tracker")
+                        print("\nFailed to initialize tracker. Please try selecting a different object.")
+                except Exception as e:
+                    logger.error(f"Error initializing tracker: {str(e)}")
+                    print("\nError initializing tracker. Please try again.")
+            else:
+                logger.info("No objects found near clicked point")
+                print("\nNo objects found near clicked point. Please click closer to an object.")
+
+    def similar_boxes(self, box1, box2, iou_threshold=0.5):
+        """Check if two boxes are similar based on IoU"""
+        if box1 is None or box2 is None:
+            return False
+            
+        # Extract coordinates
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        
+        # Calculate intersection
+        x_left = max(x1, x2)
+        y_top = max(y1, y2)
+        x_right = min(x1 + w1, x2 + w2)
+        y_bottom = min(y1 + h1, y2 + h2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return False
+            
+        intersection = (x_right - x_left) * (y_bottom - y_top)
+        area1 = w1 * h1
+        area2 = w2 * h2
+        iou = intersection / float(area1 + area2 - intersection)
+        
+        return iou > iou_threshold
 
 def check_video_file(file_path):
     """Check if a video file exists and is readable"""
@@ -510,8 +635,8 @@ def check_video_file(file_path):
 if __name__ == "__main__":
     # List of video sources to track
     video_sources = [
-        "E:\\cam3.mp4",
-        "E:\\cam2.mp4"
+        "E:\\cam2.mp4",
+        "E:\\cam3.mp4"
     ]
     
     # Check if video files exist
@@ -595,14 +720,13 @@ if __name__ == "__main__":
         
         # Print detailed instructions
         print("\n=== HOW TO USE THE TRACKING SYSTEM ===")
-        print("1. When the videos start playing, press 's' to start drawing a tracking box on any camera")
-        print("2. You'll be asked to select which camera to track from (enter the number)")
-        print("3. Click and drag on the video to draw a box around the person/object you want to track")
-        print("4. Press ENTER or SPACE to confirm your selection")
-        print("5. The system will start tracking that person/object across all cameras")
+        print("1. When the videos start playing, press 'p' to pause the video")
+        print("2. Click near the object you want to track")
+        print("3. Press 'p' again to resume tracking")
+        print("4. The system will start tracking that person/object across all cameras")
         print("\nControls:")
         print("  'p' - Pause/Resume video playback")
-        print("  's' - Draw a new tracking box on a different camera")
+        print("  Click - Select object to track (video must be paused)")
         print("  'q' - Quit the application")
         print("\nPress Enter to start tracking...")
         input()
