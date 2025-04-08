@@ -4,17 +4,37 @@ import logging
 import os
 import sys
 from ultralytics import YOLO
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from PIL import Image
 
-# Configure logging
+# Configure logging with more detailed format
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.FileHandler("tracker_log.txt"),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger("ObjectTracker")
+
+class SimpleReID(nn.Module):
+    def __init__(self):
+        super(SimpleReID, self).__init__()
+        # Use ResNet18 as backbone for feature extraction
+        self.backbone = torch.hub.load('pytorch/vision:v0.10.0', 'resnet18', pretrained=True)
+        # Remove the last fully connected layer
+        self.backbone = nn.Sequential(*list(self.backbone.children())[:-1])
+        # Add a new FC layer for ReID features
+        self.fc = nn.Linear(512, 256)
+        
+    def forward(self, x):
+        x = self.backbone(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return nn.functional.normalize(x, p=2, dim=1)  # L2 normalize the features
 
 class DrawTracker:
     def __init__(self, video_sources, yolo_model="yolov8n.pt", yolo_conf=0.5):
@@ -27,6 +47,28 @@ class DrawTracker:
         logger.info(f"Loading YOLO model: {yolo_model}")
         self.yolo = YOLO(yolo_model)
         logger.info(f"YOLO model loaded: {yolo_model}")
+        
+        # Initialize ReID model
+        logger.info("Initializing ReID model...")
+        self.reid_model = SimpleReID()
+        if torch.cuda.is_available():
+            self.reid_model = self.reid_model.cuda()
+        self.reid_model.eval()
+        logger.info("ReID model initialized")
+        
+        # ReID transform
+        self.reid_transform = transforms.Compose([
+            transforms.Resize((256, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Store features of tracked object
+        self.tracked_features = None
+        self.reid_threshold = 0.85  # Increased from 0.7 to 0.85 for stricter matching
+        
+        # Add debug mode
+        self.debug_mode = True
         
         # Initialize video captures
         self.caps = []
@@ -60,6 +102,77 @@ class DrawTracker:
         self.start_point = None
         self.end_point = None
         self.current_camera = None
+        
+        # Add tracking state variables
+        self.lost_track_frames = 0
+        self.max_lost_frames = 10  # Number of frames to wait before considering track lost
+        self.last_valid_bbox = None  # Store last valid bounding box
+        self.track_lost = False  # Flag to indicate if track is lost
+    
+    def extract_reid_features(self, frame, bbox):
+        """Extract ReID features from a person bounding box"""
+        try:
+            x, y, w, h = map(int, bbox)
+            if x < 0 or y < 0 or w <= 0 or h <= 0:
+                logger.warning("Invalid bounding box coordinates for ReID")
+                return None
+            
+            # Extract person ROI
+            person_roi = frame[y:y+h, x:x+w]
+            if person_roi.size == 0:
+                logger.warning("Empty ROI for ReID")
+                return None
+            
+            # Convert to PIL Image
+            person_roi = cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB)
+            person_pil = Image.fromarray(person_roi)
+            
+            # Apply transforms
+            person_tensor = self.reid_transform(person_pil).unsqueeze(0)
+            if torch.cuda.is_available():
+                person_tensor = person_tensor.cuda()
+            
+            # Extract features
+            with torch.no_grad():
+                features = self.reid_model(person_tensor)
+            
+            return features.cpu()
+        except Exception as e:
+            logger.error(f"Error extracting ReID features: {str(e)}")
+            return None
+    
+    def compute_similarity(self, features1, features2):
+        """Compute cosine similarity between two feature vectors"""
+        if features1 is None or features2 is None:
+            return 0.0
+        
+        try:
+            # Normalize features before computing similarity
+            features1 = torch.nn.functional.normalize(features1, p=2, dim=1)
+            features2 = torch.nn.functional.normalize(features2, p=2, dim=1)
+            
+            # Compute cosine similarity
+            similarity = torch.nn.functional.cosine_similarity(features1, features2)
+            return similarity.item()
+        except Exception as e:
+            logger.error(f"Error computing similarity: {str(e)}")
+            return 0.0
+    
+    def detect_person_in_frame(self, frame):
+        """Detect persons in the frame using YOLO"""
+        try:
+            results = self.yolo(frame, conf=self.yolo_conf, classes=[0])  # class 0 is person
+            boxes = []
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    w = x2 - x1
+                    h = y2 - y1
+                    boxes.append((int(x1), int(y1), int(w), int(h)))
+            return boxes
+        except Exception as e:
+            logger.error(f"Error detecting persons: {str(e)}")
+            return []
     
     def run(self):
         """Run the tracker on multiple video streams."""
@@ -107,16 +220,106 @@ class DrawTracker:
                 frames[i] = frame.copy()
                 
                 # Process frame for tracking
-                if self.tracking_enabled and i == self.tracking_camera and self.tracker is not None:
-                    # Update tracker
-                    success, bbox = self.tracker.update(frame)
-                    
-                    if success:
-                        # Draw tracking box
-                        (x, y, w, h) = [int(v) for v in bbox]
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        cv2.putText(frame, "Tracking", (x, y - 10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                if self.tracking_enabled:
+                    if i == self.tracking_camera:
+                        if self.track_lost:
+                            # If track was lost, try to find match in this camera
+                            detected_boxes = self.detect_person_in_frame(frame)
+                            best_match = None
+                            best_similarity = 0
+                            
+                            for box in detected_boxes:
+                                features = self.extract_reid_features(frame, box)
+                                if features is not None:
+                                    similarity = self.compute_similarity(self.tracked_features, features)
+                                    if similarity > best_similarity:
+                                        best_similarity = similarity
+                                        best_match = box
+                            
+                            if best_match is not None and best_similarity > self.reid_threshold:
+                                # Found match in original camera, resume tracking
+                                self.tracker = cv2.legacy.TrackerCSRT_create()
+                                success = self.tracker.init(frame, best_match)
+                                if success:
+                                    self.track_lost = False
+                                    self.lost_track_frames = 0
+                                    logger.info(f"Resumed tracking in camera {i+1}")
+                                    
+                                    x, y, w, h = best_match
+                                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                                    cv2.putText(frame, "Tracking Resumed", (x, y - 10),
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        else:
+                            # Normal tracking update
+                            success, bbox = self.tracker.update(frame)
+                            
+                            if success:
+                                # Reset lost track counter on successful tracking
+                                self.lost_track_frames = 0
+                                self.last_valid_bbox = bbox
+                                
+                                # Draw tracking box
+                                (x, y, w, h) = [int(v) for v in bbox]
+                                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                                cv2.putText(frame, "Tracking", (x, y - 10),
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                
+                                # Update ReID features periodically
+                                self.tracked_features = self.extract_reid_features(frame, bbox)
+                            else:
+                                # Increment lost track counter
+                                self.lost_track_frames += 1
+                                if self.lost_track_frames >= self.max_lost_frames:
+                                    self.track_lost = True
+                                    logger.info(f"Lost track in camera {i+1}, switching to search mode")
+                                    cv2.putText(frame, "Track Lost - Searching", (30, 30),
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    else:
+                        # Search for matches in other cameras
+                        detected_boxes = self.detect_person_in_frame(frame)
+                        best_match = None
+                        best_similarity = 0
+                        
+                        for box in detected_boxes:
+                            features = self.extract_reid_features(frame, box)
+                            if features is not None:
+                                similarity = self.compute_similarity(self.tracked_features, features)
+                                
+                                if similarity > best_similarity:
+                                    best_similarity = similarity
+                                    best_match = (box, similarity)
+                                
+                                # Draw all detection boxes with scores in debug mode
+                                if self.debug_mode:
+                                    x, y, w, h = box
+                                    color = (0, 165, 255)  # Orange for non-matches
+                                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
+                                    cv2.putText(frame, f"{similarity:.2f}", (x, y - 5),
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                        
+                        # If track is lost in primary camera and we find a good match here, switch cameras
+                        if self.track_lost and best_match is not None:
+                            box, similarity = best_match
+                            if similarity > self.reid_threshold:
+                                # Switch tracking to this camera
+                                self.tracking_camera = i
+                                self.tracker = cv2.legacy.TrackerCSRT_create()
+                                success = self.tracker.init(frame, box)
+                                if success:
+                                    self.track_lost = False
+                                    self.lost_track_frames = 0
+                                    logger.info(f"Switched tracking to camera {i+1}")
+                                    
+                                    x, y, w, h = box
+                                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                                    cv2.putText(frame, "Tracking Switched", (x, y - 10),
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                            elif best_similarity > 0:
+                                # Draw best match even if below threshold
+                                x, y, w, h = box
+                                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                                cv2.putText(frame, f"Potential Match: {similarity:.2f}", (x, y - 10),
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 
                 # Display the frame
                 cv2.imshow(f"Camera {i+1} - {os.path.basename(self.video_sources[i])}", frame)
@@ -307,8 +510,8 @@ def check_video_file(file_path):
 if __name__ == "__main__":
     # List of video sources to track
     video_sources = [
-        "E:\\cam1.mp4",
-        "E:\\Single1.mp4"
+        "E:\\cam3.mp4",
+        "E:\\cam2.mp4"
     ]
     
     # Check if video files exist
