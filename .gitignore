@@ -2,16 +2,6 @@ __pycache__
 *.pyc
 *.pyo
 *.pyd
-*.pdb
-*.egg
-*.egg-info
-*.whl
-*.dist-info
-*.db
-*.sqlite3
-*.log
-*.coverage
-*.mypy_cache
-*.pytest_cache
 *.vscode
 .venv
+source/
