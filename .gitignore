@@ -3,5 +3,7 @@ __pycache__
 *.pyo
 *.pyd
 *.vscode
-.venv
 source/
+*.env
+.venv/
+*tracker_log.txt
