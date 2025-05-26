@@ -1,7 +1,7 @@
 
 
 services:
-  web:
+  tracker:
     build: .
     container_name: tracker
     ports:
