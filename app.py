@@ -57,6 +57,7 @@ class DrawTracker:
         logger.info("ReID model initialized")
         
         # ReID transform
+        #🧪 Preprocessing Pipeline for ReID
         self.reid_transform = transforms.Compose([
             transforms.Resize((256, 128)),
             transforms.ToTensor(),
@@ -635,8 +636,8 @@ def check_video_file(file_path):
 if __name__ == "__main__":
     # List of video sources to track
     video_sources = [
-        "E:\\cam2.mp4",
-        "E:\\cam3.mp4"
+        "./cam2.mp4",
+        "./cam3.mp4"
     ]
     
     # Check if video files exist
