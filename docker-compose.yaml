@@ -1,0 +1,15 @@
+
+
+services:
+  web:
+    build: .
+    container_name: tracker
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+    # Expose all NVIDIA GPUs to this container
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+
