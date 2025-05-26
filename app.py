@@ -66,8 +66,8 @@ class DrawTracker:
         
         # Store features of tracked object
         self.tracked_features = None
-        self.reid_threshold = 0.90  # Increased threshold for high confidence matches
-        self.recovery_threshold = 0.85  # Increased recovery threshold
+        self.reid_threshold = 0.85  # Increased threshold for high confidence matches
+        self.recovery_threshold = 0.80  # Increased recovery threshold
         self.show_threshold = 0.70  # Threshold for showing matches at all
         
         # Add debug mode
@@ -310,7 +310,7 @@ class DrawTracker:
                             
                             if recovered_box is not None and similarity > self.recovery_threshold:
                                 # Reinitialize tracker with recovered box
-                                self.tracker = cv2.TrackerCSRT_create()
+                                self.tracker = cv2.legacy.TrackerCSRT_create()
                                 success = self.tracker.init(frame, recovered_box)
                                 
                                 if success:
@@ -342,7 +342,7 @@ class DrawTracker:
                                 
                                 if recovered_box is not None and similarity > self.recovery_threshold:
                                     # Reinitialize tracker with recovered box
-                                    self.tracker = cv2.TrackerCSRT_create()
+                                    self.tracker = cv2.legacy.TrackerCSRT_create()
                                     success = self.tracker.init(frame, recovered_box)
                                     
                                     if success:
@@ -468,7 +468,7 @@ class DrawTracker:
                                     print(f"\nSwitching to camera {i+1} - High confidence match: {similarity*100:.1f}%")
                                     # Switch tracking to this camera
                                     self.tracking_camera = i
-                                    self.tracker = cv2.TrackerCSRT_create()
+                                    self.tracker = cv2.legacy.TrackerCSRT_create()
                                     success = self.tracker.init(frame, box)
                                     if success:
                                         self.track_lost = False
@@ -544,7 +544,7 @@ class DrawTracker:
             if closest_box is not None:
                 # Initialize tracker with the closest detection
                 try:
-                    self.tracker = cv2.TrackerCSRT_create()
+                    self.tracker = cv2.legacy.TrackerCSRT_create()
                     success = self.tracker.init(frame, closest_box)
                     
                     if success:
